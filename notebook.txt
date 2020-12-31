@@ -1,0 +1,183 @@
+import os
+import numpy as np
+import torch
+from PIL import Image
+import cv2
+import matplotlib.pyplot as plt
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from tqdm import tqdm
+
+。。。。
+class SteelDataset(object):
+    def __init__(self, root, transforms):
+        self.root = root
+        self.transforms = transforms
+        self.content = np.loadtxt('train.csv', str, delimiter=',', skiprows=1)
+        self.imgs = list(sorted(np.unique(self.content[:,0])))
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root, "train_images", self.imgs[idx])
+        img = Image.open(img_path).convert("RGB")
+
+        id = np.where(self.content[:,0] == self.imgs[idx])[0]
+        boxes = []
+        masks = []
+        labels = []
+        area = []
+        image_id = torch.tensor([idx])
+        iscrowd = []
+
+        for row in id:
+            mask_describe = self.content[row, 2]
+            mask_describe = mask_describe.split(' ')  # list
+            mask = np.zeros(256 * 1600, dtype=np.uint8)
+            mask_cpy = mask.copy()
+            for x, element in enumerate(mask_describe):
+                if x % 2 == 0:
+                    pixel_start = int(mask_describe[x])
+                    pixel_len = int(mask_describe[x + 1])
+                    mask_cpy[pixel_start - 1:pixel_start+pixel_len-1] = 255
+            mask_cpy = np.reshape(mask_cpy,(256,1600),'F')
+            # plt.imshow(mask_cpy)
+            # plt.show()
+            cv2.imshow('a',mask_cpy)
+            cv2.waitKey()
+            cont,_ = cv2.findContours(mask_cpy,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+            # print(len(cont))
+            for i in range(len(cont)):
+                mask_res = np.zeros((256,1600))
+                cv2.drawContours(mask_res,cont,i,1,-1)
+                # plt.imshow(mask_res)
+                # plt.show()
+
+                # cv2.imshow('a',mask_res)
+                # cv2.waitKey()
+                pos = np.where(mask_res)
+                xmin = np.min(pos[1])
+                xmax = np.max(pos[1])
+                ymin = np.min(pos[0])
+                ymax = np.max(pos[0])
+                # if (xmin==xmax or ymin == ymax):
+                # #     # print(idx)
+                # #     # xmax += 1
+                # #     # ymax += 1
+                #     continue
+                masks.append(mask_res)
+                labels.append(int(self.content[row, 1]))
+                boxes.append([xmin, ymin, xmax, ymax])
+                # cv2.rectangle(mask_res,(xmin, ymin),(xmax, ymax),128,3)
+                #
+                # cv2.imshow('a',mask_res)
+                # cv2.waitKey()
+
+                area.append((xmax - xmin) * (ymax - ymin))
+
+                iscrowd.append(0)
+
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        labels = torch.as_tensor(labels, dtype=torch.int64)
+        masks = torch.as_tensor(masks, dtype=torch.uint8)
+        area = torch.as_tensor(area, dtype=torch.float32)
+        iscrowd = torch.as_tensor(iscrowd, dtype=torch.int64)
+
+        target = {}
+        target["boxes"] = boxes
+        target["labels"] = labels
+        target["masks"] = masks
+        target["image_id"] = image_id
+        target["area"] = area
+        target["iscrowd"] = iscrowd
+
+        if self.transforms is not None:
+            img, target = self.transforms(img, target)
+
+        # print(target)
+        return img, target
+
+    def __len__(self):
+        return len(self.imgs)
+
+。。。。。。
+
+def get_model_instance_segmentation(num_classes):
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=True)
+
+    # get number of input features for the classifier
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    # replace the pre-trained head with a new one
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    # now get the number of input features for the mask classifier
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    hidden_layer = 256
+    # and replace the mask predictor with a new one
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask,
+                                                       hidden_layer,
+                                                       num_classes)
+    return model
+。。。。。。
+
+def get_transform(train):
+    transforms = []
+    transforms.append(T.ToTensor())
+    # if train:
+        # transforms.append(T.RandomHorizontalFlip(0.5))
+    return T.Compose(transforms)
+。。。。。。。
+
+def get_model_result(img, path):
+    device = 'cuda'
+    model = get_model_instance_segmentation(5)
+    model.load_state_dict(torch.load(os.path.join('/kaggle/input/model-ckpt',path)))
+    model.to(device)
+    model.eval()
+
+    img = cv2.imread(os.path.join('/kaggle/input/severstal-steel-defect-detection/test_images', img))
+    img = cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+    img = np.transpose(img,(2,0,1))
+    img = torch.from_numpy(img).float().div(255)
+    img = img.to(device)
+    # print(img.shape)
+    # print(img)
+
+    target = model([img])
+    # print(target)
+    masks = target[0]['masks'].detach().cpu().numpy()
+    labels = target[0]['labels'].detach().cpu().numpy()
+
+    labels_unq = np.unique(labels)
+    masks = np.squeeze(masks,1)
+    masks = np.where(masks,1,0)
+    masks_final = np.zeros((len(labels_unq),256,1600))
+    for i,lab in enumerate(labels_unq):
+        idx = np.where(labels==lab)[0]
+        # print(idx)
+
+        masks_final[i] = np.sum(masks[idx],axis=0)
+        # print(np.unique(masks_final[i]))
+        masks_final = np.where(masks_final==0,0,1).astype(np.uint8)
+
+        # print(masks_final)
+    return masks_final,labels_unq
+
+def mask2rle(mask):
+    pixels= mask.flatten()
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    return ' '.join(str(x) for x in runs)
+
+。。。。。。。。
+content = np.loadtxt('/kaggle/input/severstal-steel-defect-detection/sample_submission.csv', str, delimiter=',', skiprows=1)
+final_submission = np.array(['ImageId','EncodedPixels','ClassId'])[None,:]
+# print(content)
+for row in tqdm(content):
+    masks,labels = get_model_result(row[0],'epoch20.ckpt')
+
+    for i,lab in enumerate(labels):
+        img = row[0]
+        rle = mask2rle(masks[i])
+        final_submission = np.append(final_submission, np.array([img,rle,lab])[None, :], axis=0)
+np.savetxt('submission.csv', final_submission, fmt='%s', delimiter=',')
